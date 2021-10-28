@@ -1,0 +1,4 @@
+--------------------------------- 
+ 
+Exact floating point  
+Average RE  0 % 
