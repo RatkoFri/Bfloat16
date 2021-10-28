@@ -12,6 +12,7 @@ void float2bfloat(const float src, float& dst) {
 #else
 	q[0] = 0;
 	q[1] = p[1];
+
 #endif
 }
 
