@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <limits.h>
+#include <inttypes.h>
+
 
 #define FLOAT_MANT_BITS    (23)
 #define FLOAT_EXPO_BITS    (8)
@@ -23,7 +25,61 @@
 #define FLOAT_QNAN_BIT     (0x00400000)
 #define MAX_SHIFT          (FLOAT_MANT_BITS + 2)
 
-uint32_t fp32_mul_core (uint32_t a, uint32_t b)
+
+void float2bfloat(const float src, float& dst) {
+	const uint16_t* p = reinterpret_cast<const uint16_t*>(&src);
+	uint16_t* q = reinterpret_cast<uint16_t*>(&dst);
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  q[0] = p[0];
+  q[1] = 0;
+#else
+	q[0] = 0;
+	q[1] = p[1];
+#endif
+}
+
+
+uint8_t LOD(uint8_t val){
+    uint32_t n = 0, x;
+    x = val;
+    if (x <= 0x0000ffff) n += 16, x <<= 16;
+    if (x <= 0x00ffffff) n += 8, x <<= 8;
+    if (x <= 0x0fffffff) n += 4, x <<= 4;
+    if (x <= 0x3fffffff) n += 2, x <<= 2;
+    if (x <= 0x7fffffff) n++;
+    return 31 - n;
+}
+
+uint16_t ILM(uint8_t a, uint8_t b, uint8_t iter){
+    /*
+        a, b -> input operands,
+        iter -> number of iterations
+        only two iterations supported
+    */
+    if (a == 0 || b == 0) return 0;
+
+    uint8_t Ka, Kb; 
+    Ka = LOD(a);
+    Kb = LOD(b);
+
+    uint8_t ResA, ResB, Res2B;
+    ResA = a ^ (1 << Ka);
+    ResB = b ^ (1 << Kb);
+
+    uint16_t prod0, prod1;
+    prod0 = a * (1<<Kb) + ResB * (1<<Ka);
+    prod1 = 0;
+    if(iter == 2){
+        Ka = LOD(ResA);
+        Kb = LOD(ResB);
+        Res2B = ResB ^ (1 << Kb);
+        prod1 = ResA * (1<<Kb) + Res2B * (1<<Ka);
+    }
+
+    return prod0 + prod1;
+}
+
+uint32_t fp32_mul_core (uint32_t a, uint32_t b, uint8_t iter)
 {
     uint64_t prod;
     uint32_t expoa, expob, manta, mantb, shift;
@@ -80,7 +136,11 @@ uint32_t fp32_mul_core (uint32_t a, uint32_t b)
     expor = expoa + expob - FLOAT_EXPO_BIAS + 2 * EXPO_ADJUST;
     mantb = mantb ; /* preshift to align result signficand */
     /* result significand: multiply argument signficands */
-    prod = (uint64_t)manta * mantb;
+    uint8_t mantA_short = manta >> 16; // Take only 8 bits (1 plus 7 bits of mantissa)
+    uint8_t mantB_short = mantb >> 16; // Take only 8 bits (1 plus 7 bits of mantissa)
+    uint16_t p_short = ILM(mantA_short,mantB_short,iter);
+
+    prod = (uint64_t)p_short << 32;
     prod = prod << FLOAT_EXPO_BITS;
     mantr_hi = (uint32_t)(prod >> 32);
     mantr_lo = (uint32_t)(prod >>  0);
@@ -127,115 +187,79 @@ float uint_as_float (uint32_t a)
     return r;
 }
 
-float fp32_mul (float a, float b)
+float fp32_mul (float a, float b, uint8_t iter)
 {
-    return uint_as_float (fp32_mul_core (float_as_uint (a), float_as_uint (b)));
+    return uint_as_float (fp32_mul_core (float_as_uint (a), float_as_uint (b),iter));
 }
 
-/* Fixes via: Greg Rose, KISS: A Bit Too Simple. http://eprint.iacr.org/2011/007 */
-static unsigned int z=362436069,w=521288629,jsr=362436069,jcong=123456789;
-#define znew (z=36969*(z&0xffff)+(z>>16))
-#define wnew (w=18000*(w&0xffff)+(w>>16))
-#define MWC  ((znew<<16)+wnew)
-#define SHR3 (jsr^=(jsr<<13),jsr^=(jsr>>17),jsr^=(jsr<<5)) /* 2^32-1 */
-#define CONG (jcong=69069*jcong+13579)                     /* 2^32 */
-#define KISS ((MWC^CONG)+SHR3)
+/*
+Strategija: 
 
-#define ISNAN(x) ((float_as_uint (x) << 1) > 0xff000000)
-#define QNAN(x)  (x | FLOAT_QNAN_BIT)
+1. Konverzija iz Floating pointa v BFloat16 - f-ja float2bfloat
+    Slabosti: Groba konverzija v BFloat16, samo daje stran spodnjih 16 bitov 
+2. Mnozenje Bfloat16 stevil s pomocjo single precision mnozilnika. 
+    Prednosti: Super koda. Dragac pa pri mnozenju ne smemo pozabiti da so spodnjih 16 bitov vedno enaki 0
+    Slabosti: Overkill za CNNove, prevec se ukvarja z nedovoljenim slucaji da je noro. Za simulacijsko verzijo je OK, 
+    za CNN pa ne vem. 
 
-#define PURELY_RANDOM  (0)
-#define PATTERN_BASED  (1)
-
-#define TEST_MODE      (PURELY_RANDOM)
-
-uint32_t v[8192];
+*/
+#define NUM_RAND 10000
+// F-ja za generiranje floating point števil
+float RandomFloat(float min, float max){
+   return ((max - min) * ((float)rand() / RAND_MAX)) + min;
+}
 
 int main (void)
 {
-    unsigned long long count = 0;
-    float a, b, res, ref;
-    uint32_t i, j, patterns, idx = 0, nbrBits = sizeof (uint32_t) * CHAR_BIT;
+   	float a = 2.5;
+	float b = 3.1245;
+	float tmp_b,tmp_a;
 
-    /* pattern class 1: 2**i */
-    for (i = 0; i < nbrBits; i++) {
-        v [idx] = ((uint32_t)1 << i);
-        idx++;
-    }
-    /* pattern class 2: 2**i-1 */
-    for (i = 0; i < nbrBits; i++) {
-        v [idx] = (((uint32_t)1 << i) - 1);
-        idx++;
-    }
-    /* pattern class 3: 2**i+1 */
-    for (i = 0; i < nbrBits; i++) {
-        v [idx] = (((uint32_t)1 << i) + 1);
-        idx++;
-    }
-    /* pattern class 4: 2**i + 2**j */
-    for (i = 0; i < nbrBits; i++) {
-        for (j = 0; j < nbrBits; j++) {
-            v [idx] = (((uint32_t)1 << i) + ((uint32_t)1 << j));
-            idx++;
+    FILE *log;
+	char p;
+
+	float2bfloat(b,tmp_b);
+	float2bfloat(a,tmp_a);
+
+	printf("True product %f\n", a*b);
+	printf("Reduced precision product %f\n", tmp_a*tmp_b);
+	printf("Reduced precision product %f\n", fp32_mul(tmp_a,tmp_b,2));
+    float p_exact, p_approx;
+
+    float RE = 0;
+    int i;
+    for(i=0;i<RAND_MAX;i++){
+        float2bfloat(RandomFloat(-10000,10000),tmp_a);
+        float2bfloat(RandomFloat(-10000,10000),tmp_b);
+        p_exact = tmp_a * tmp_b;
+        p_approx = fp32_mul(tmp_a,tmp_b,2);
+        if(p_exact == 0){
+            RE += 0;
+        }
+        else{
+            RE += abs(p_exact - p_approx)/abs(p_exact);
         }
     }
-    /* pattern class 5: 2**i - 2**j */
-    for (i = 0; i < nbrBits; i++) {
-        for (j = 0; j < nbrBits; j++) {
-            v [idx] = (((uint32_t)1 << i) - ((uint32_t)1 << j));
-            idx++;
-        }
-    }
-    /* pattern class 6: MAX_UINT/(2**i+1) rep. blocks of i zeros an i ones */
-    for (i = 0; i < nbrBits; i++) {
-        v [idx] = ((~(uint32_t)0) / (((uint32_t)1 << i) + 1));
-        idx++;
-    }
-    patterns = idx;
-    /* pattern class 6: one's complement of pattern classes 1 through 5 */
-    for (i = 0; i < patterns; i++) {
-        v [idx] = ~v [i];
-        idx++;
-    }
-    /* pattern class 7: two's complement of pattern classes 1 through 5 */
-    for (i = 0; i < patterns; i++) {
-        v [idx] = ~v [i] + 1;
-        idx++;
-    }
-    patterns = idx;
 
-#if TEST_MODE == PURELY_RANDOM
-    printf ("using purely random test vectors\n");
-#elif TEST_MODE == PATTERN_BASED
-    printf ("using pattern-based test vectors\n");
-    printf ("#patterns = %u\n", patterns);
-#endif // TEST_MODE
+    printf("Relative error %f\n ", RE/RAND_MAX/RAND_MAX);
 
-    do {
-#if TEST_MODE == PURELY_RANDOM
-        a = uint_as_float (KISS);
-        b = uint_as_float (KISS);
-#elif TEST_MODE == PATTERN_BASED
-        i = KISS % patterns;
-        j = KISS % patterns;
-        a = uint_as_float ((v[i] & 0x7fffff) | (KISS & ~0x7fffff));
-        b = uint_as_float ((v[j] & 0x7fffff) | (KISS & ~0x7fffff));
-#endif // TEST_MODE
-        res = fp32_mul (a, b);
-        ref = a * b;
-        /* check for bit pattern mismatch between result and reference */
-        if (float_as_uint (res) != float_as_uint (ref)) {
-            /* if both a and b are NaNs, either could be returned quietened */
-            if (! (ISNAN (a) && ISNAN (b) &&
-                   ((QNAN (float_as_uint (a)) == float_as_uint (res)) ||
-                    (QNAN (float_as_uint (b)) == float_as_uint (res))))) {
-                printf ("err: a=% 15.8e (%08x)  b=% 15.8e (%08x)  res=% 15.8e (%08x)  ref=%15.8e (%08x)\n",
-                        a, float_as_uint(a), b, float_as_uint (b), res, float_as_uint (res), ref, float_as_uint (ref));
-                return EXIT_FAILURE;
-            }
-        }
-        count++;
-        if (!(count & 0xffffff)) printf ("\r%llu", count);
-    } while (1);
-    return EXIT_SUCCESS;
+    log = fopen("log/EX_log.txt", "a");
+
+		if (log != NULL)
+		{	
+			
+			char str0[] = "--------------------------------- \n \n";
+			char str1[80];
+
+			fputs(str0, log);
+			sprintf(str1, "Exact floating point  \n" );
+			fputs(str1, log);
+
+			sprintf(str1, "Average RE %2.10g %% \n", (RE/RAND_MAX/RAND_MAX));
+			fputs(str1, log);
+
+			fclose(log);
+		}
+
+	return 0; 
 }
